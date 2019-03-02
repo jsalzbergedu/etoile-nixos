@@ -1,0 +1,122 @@
+122 lines (108 sloc) 4.2 KB
+# Usage: use_nix [...]
+#
+# Load environment variables from `nix-shell`.
+# If you have a `default.nix` or `shell.nix` one of these will be used and
+# the derived environment will be stored at ./.direnv/env-<hash>
+# and symlink to it will be created at ./.direnv/default.
+# Dependencies are added to the GC roots, such that the environment remains persistent.
+#
+# The resulting environment is cached for better performance.
+#
+# To trigger switch to a different environment:
+# `rm -f .direnv/default`
+#
+# To derive a new environment:
+# `rm -rf .direnv/env-$(md5sum {shell,default}.nix 2> /dev/null | cut -c -32)`
+#
+# To remove cache:
+# `rm -f .direnv/dump-*`
+#
+# To remove all environments:
+# `rm -rf .direnv/env-*`
+#
+# To remove only old environments:
+# `find .direnv -name 'env-*' -and -not -name `readlink .direnv/default` -exec rm -rf {} +`
+#
+set -eo pipefail
+
+clean_nix_shell_dump() {
+    local to_remove=(
+        "TMP" "TMPDIR" "TEMP" "TEMPDIR"
+        "USER"
+        "NIX_[^=]\+"
+        "DETERMINISTIC_BUILD"
+        "PYTHONPATH" "PYTHONHASHSEED" "PYTHONNOUSERSITE"
+        "SOURCE_DATE_EPOCH" "STRINGS" "STRIP" "OBJCOPY" "OBJDUMP" "DISPLAY"
+        "__ETC_PROFILE_SOURCED" "SHELL" "HOME" "SHLVL"
+        "PAGER" "READELF" "PWD" "TERM" "LOGNAME" "_PATH" "SIZE" "TARGET_HOST" "RANLIB" "WINDRES"
+        "_" "AR" "AS" "CC" "LD" "NM" "CONFIG_SHELL" "CXX" "HOST_PATH" "IN_NIX_SHELL"
+        "AR_FOR_TARGET" "AS_FOR_TARGET" "CC_FOR_TARGET" "CXX_FOR_TARGET" "LD_FOR_TARGET"
+        "NM_FOR_TARGET" "OBJCOPY_FOR_TARGET" "OBJDUMP_FOR_TARGET" "RANLIB_FOR_TARGET"
+        "READELF_FOR_TARGET" "SIZE_FOR_TARGET" "STRINGS_FOR_TARGET" "STRIP_FOR_TARGET" "TARGET_AR"
+        "TARGET_AS" "TARGET_CC" "TARGET_CXX" "TARGET_LD" "TARGET_NM" "TARGET_OBJCOPY" "TARGET_OBJDUMP"
+        "TARGET_RANLIB" "TARGET_READELF" "TARGET_SIZE" "TARGET_STRINGS" "TARGET_STRIP"
+        "TARGET_WINDRES" "WINDRES_FOR_TARGET"
+    )
+    sed -iEe 's/;export/;\nexport/g' $1
+    sed -iEe 's/export \$.*;//g' $1
+    for r in "${to_remove[@]}"; do
+        sed -iEe "s/export $r=.*;//g" $1
+    done
+}
+
+use_nix() {
+    # define all local variables
+    local f env_hash dir default wd drv dump path_backup
+    local shell="shell.nix"
+    local files_to_watch=("shell.nix")
+
+    # compute the hash of all the files that makes up the development environment
+    env_hash="$(hashContents "${files_to_watch[@]}")"
+
+    dir="$(direnv_layout_dir)"
+    default="${dir}/default"
+    if [[ ! -L "${default}" ]] || [[ ! -d $(readlink "${default}") ]]; then
+        wd="${dir}/env-${env_hash}"
+        mkdir -p "${wd}"
+
+        drv="${wd}/env.drv"
+        if [[ ! -f "${drv}" ]]; then
+            log_status "use nix: deriving new environment"
+            IN_NIX_SHELL=1 nix-instantiate --add-root "${drv}" --indirect "${shell}" > /dev/null
+            nix-store -r $(nix-store --query --references "${drv}") --add-root "${wd}/dep" --indirect > /dev/null
+        fi
+
+        rm -f "${default}"
+        ln -s $(basename "${wd}") "${default}"
+    fi
+
+    drv=$(readlink "${default}/env.drv")
+    dump="${dir}/dump-$(hashFile ".envrc")-$(hashFile ${drv})"
+
+    if [[ ! -f "${dump}" ]] || [[ "${XDG_CONFIG_DIR}/direnv/direnvrc" -nt "${dump}" ]]; then
+        log_status "use nix: updating cache"
+        local de=$(which direnv)
+
+        old=$(find "${dir}" -name 'dump-*')
+        nix-shell --pure "${drv}" --show-trace --run "$(join_args ${de} dump bash)" > "${dump}"
+        clean_nix_shell_dump "${dump}"
+        rm -f ${old}
+    fi
+
+    # evaluate the dump created by nix-shell earlier, but have to merge the PATH
+    # with the current PATH
+    # NOTE: we eval the dump here as opposed to direnv_load it because we don't
+    # want to persist environment variables coming from the shell at the time of
+    # the dump. See https://github.com/direnv/direnv/issues/405 for context.
+    path_backup="${PATH}"
+    # direnv_load cat "${dump}"
+    eval $(cat "${dump}")
+    export PATH="${PATH}:${path_backup}"
+
+    for f in "${files_to_watch[@]}"; do
+        watch_file "${f}"
+    done
+}
+
+hashContents() {
+    if has md5sum; then
+        cat "${@}" | md5sum | cut -c -32
+    elif has md5; then
+        cat "${@}" | md5 -q
+    fi
+}
+
+hashFile() {
+    if has md5sum; then
+        md5sum "${@}" | cut -c -32
+    elif has md5; then
+        md5 -q "${@}"
+    fi
+}
