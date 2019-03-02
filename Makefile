@@ -9,5 +9,6 @@ install: system/configuration.nix
 	nixos-rebuild boot
 
 .PHONY: install-user
+install-user: user/direnvrc
 	mkdir -p ~/.config/direnv
 	cp user/direnvrc ~/.config/direnv/direnvrc
